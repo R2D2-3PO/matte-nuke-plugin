@@ -1,2 +1,90 @@
-readme
+# Matte Nuke Plugin
 
+Nuke 15 C++ plugin scaffold for refined image matting with BiRefNet.
+
+当前仓库先把主框架搭好：
+- Nuke 原生节点骨架
+- ONNX Runtime 推理后端接口
+- BiRefNet 模型接入预留位
+- 输入图像 -> alpha/mask 输出的基本流程
+
+现在的节点会先走一个占位 matte 逻辑，方便你把工程、编译链和 Nuke 加载流程先跑通；后面只需要把真实的 BiRefNet 预处理、ONNX 推理和后处理补进去。
+
+## Planned Architecture
+
+```text
+Nuke Input RGBA
+    -> BiRefNetMatteIop
+    -> frame/tile sampling
+    -> BiRefNetOnnxBackend
+    -> ONNX Runtime session
+    -> mask / alpha output
+```
+
+## Project Layout
+
+```text
+.
+├── CMakeLists.txt          # CMake 入口，转到 CMakeList.txt
+├── CMakeList.txt           # 主要构建配置
+├── include/
+│   └── BiRefNetPlugin/
+│       ├── BiRefNetMatteIop.h
+│       ├── BiRefNetOnnxBackend.h
+│       └── MatteTypes.h
+└── src/
+    ├── BiRefNetMatteIop.cpp
+    ├── BiRefNetOnnxBackend.cpp
+    └── plugin.cpp
+```
+
+## What Is Already Wired
+
+- `BiRefNetMatte` 节点已经预留这些参数：
+  - `model_path`
+  - `use_gpu`
+  - `passthrough`
+  - `mask_threshold`
+- CMake 已支持：
+  - Nuke 15 SDK / `DDImage`
+  - 可选 `ONNXRUNTIME_ROOT`
+  - 后续扩展 CUDA provider 的开关
+- `BiRefNetOnnxBackend` 已经留好两个关键入口：
+  - `initialize(...)`
+  - `infer(...)`
+
+## Next Steps For Real BiRefNet
+
+你后面主要补这几块就行：
+
+1. 导出 Hugging Face 上的 BiRefNet 为 ONNX。
+2. 在 `src/BiRefNetOnnxBackend.cpp` 里补：
+   - `Ort::Env`
+   - `Ort::SessionOptions`
+   - 模型加载
+   - 输入输出 tensor 名称
+3. 把 Nuke 输入图像整理成模型需要的格式：
+   - resize
+   - normalize
+   - HWC -> NCHW
+   - RGB / BGR 对齐
+4. 把模型输出的 mask resize 回原图大小，并写回 `Chan_Alpha`。
+5. 如果要做真正“精细化抠图”，后面通常还会继续加：
+   - trimap / 引导输入
+   - 边缘 refinement
+   - cache，避免每条扫描线重复推理
+
+## Build Notes
+
+先改这两个路径：
+
+- `NUKE_ROOT`
+- `ONNXRUNTIME_ROOT`
+
+然后正常走 CMake。当前仓库里新增了标准入口文件 `CMakeLists.txt`，这样 IDE 和命令行都能直接识别。
+
+## Important Note
+
+Nuke 节点现在是“可扩展骨架”，不是最终可用的 BiRefNet 成品推理插件。
+
+真正要上线使用时，最重要的一步不是补 UI，而是把“整帧缓存推理”做好。因为 BiRefNet 这种网络不是逐像素算子，不能长期停留在当前这种逐 scanline 的占位逻辑上；后面建议我们把整帧读取、一次推理、多次取样这条链路补完整。 

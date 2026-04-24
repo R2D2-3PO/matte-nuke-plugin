@@ -1,23 +1,102 @@
-cmake_minimum_required(VERSION 3.10)
-project(NukeInvertPlugin)
+cmake_minimum_required(VERSION 3.18)
+project(BiRefNetNukePlugin VERSION 0.1.0 LANGUAGES CXX)
 
-# 设置 C++ 标准（Nuke 15+ 建议使用 C++17 或 20）
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 寻找 Nuke 的包含路径（通常需要根据你的安装位置微调）
-set(NUKE_INCLUDE_DIR ""/Applications/Nuke15.1v5.app/Contents/MacOS/include"")
+option(MATTE_ENABLE_ONNXRUNTIME "Enable ONNX Runtime integration hooks" ON)
+option(MATTE_BUILD_WITH_CUDA "Enable CUDA execution provider hooks" OFF)
 
-include_directories(${NUKE_INCLUDE_DIR})
+# 按你本机的 Nuke 15 SDK / app 路径调整
+set(NUKE_ROOT "/Applications/Nuke15.1v5.app/Contents/MacOS" CACHE PATH "Path to the Nuke installation root")
+set(NUKE_INCLUDE_DIR "${NUKE_ROOT}/include" CACHE PATH "Path to Nuke include directory")
+set(NUKE_LIBRARY_DIR "${NUKE_ROOT}" CACHE PATH "Path to Nuke library directory")
 
-# 定义生成的插件
-add_library(InvertPlugin SHARED src/MyPlugin.cpp)
+# 可选：按你本机 ONNX Runtime 解压路径调整
+set(ONNXRUNTIME_ROOT "" CACHE PATH "Optional path to ONNX Runtime distribution")
 
-# 插件后缀
-set_target_properties(InvertPlugin PROPERTIES PREFIX "")
-if(APPLE)
-    set_target_properties(InvertPlugin PROPERTIES SUFFIX ".dylib")
-elseif(UNIX)
-    set_target_properties(InvertPlugin PROPERTIES SUFFIX ".so")
+set(MATTE_HEADERS
+    include/BiRefNetPlugin/BiRefNetMatteIop.h
+    include/BiRefNetPlugin/BiRefNetOnnxBackend.h
+    include/BiRefNetPlugin/MatteTypes.h
+)
+
+set(MATTE_SOURCES
+    src/BiRefNetMatteIop.cpp
+    src/BiRefNetOnnxBackend.cpp
+    src/plugin.cpp
+)
+
+add_library(BiRefNetMatte SHARED ${MATTE_HEADERS} ${MATTE_SOURCES})
+target_include_directories(BiRefNetMatte
+    PRIVATE
+        ${NUKE_INCLUDE_DIR}
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(BiRefNetMatte PRIVATE NOMINMAX)
+
+if(MATTE_ENABLE_ONNXRUNTIME)
+    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_ENABLE_ONNXRUNTIME=1)
 else()
-    set_target_properties(InvertPlugin PROPERTIES SUFFIX ".dll")
+    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_ENABLE_ONNXRUNTIME=0)
+endif()
+
+if(MATTE_BUILD_WITH_CUDA)
+    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_BUILD_WITH_CUDA=1)
+else()
+    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_BUILD_WITH_CUDA=0)
+endif()
+
+find_library(NUKE_DDIMAGE_LIBRARY DDImage PATHS ${NUKE_LIBRARY_DIR} NO_DEFAULT_PATH)
+if(NOT NUKE_DDIMAGE_LIBRARY)
+    message(FATAL_ERROR "DDImage library not found. Set NUKE_LIBRARY_DIR/NUKE_ROOT correctly.")
+endif()
+
+target_link_libraries(BiRefNetMatte PRIVATE ${NUKE_DDIMAGE_LIBRARY})
+
+if(MATTE_ENABLE_ONNXRUNTIME)
+    if(ONNXRUNTIME_ROOT)
+        set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/include")
+        if(APPLE)
+            find_library(ONNXRUNTIME_LIBRARY onnxruntime PATHS "${ONNXRUNTIME_ROOT}/lib" NO_DEFAULT_PATH)
+        elseif(WIN32)
+            find_library(ONNXRUNTIME_LIBRARY onnxruntime PATHS "${ONNXRUNTIME_ROOT}/lib" NO_DEFAULT_PATH)
+        else()
+            find_library(ONNXRUNTIME_LIBRARY onnxruntime PATHS "${ONNXRUNTIME_ROOT}/lib" "${ONNXRUNTIME_ROOT}/lib64" NO_DEFAULT_PATH)
+        endif()
+
+        if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIBRARY)
+            target_include_directories(BiRefNetMatte PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+            target_link_libraries(BiRefNetMatte PRIVATE ${ONNXRUNTIME_LIBRARY})
+            target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_ONNXRUNTIME=1)
+        else()
+            message(WARNING "ONNX Runtime requested but not found under ONNXRUNTIME_ROOT. Building backend stubs only.")
+            target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_ONNXRUNTIME=0)
+        endif()
+    else()
+        message(STATUS "ONNXRUNTIME_ROOT not set. Building backend stubs only.")
+        target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_ONNXRUNTIME=0)
+    endif()
+else()
+    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_ONNXRUNTIME=0)
+endif()
+
+set_target_properties(BiRefNetMatte PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "BiRefNetMatte"
+)
+
+if(APPLE)
+    set_target_properties(BiRefNetMatte PROPERTIES
+        SUFFIX ".dylib"
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "@loader_path"
+    )
+endif()
+
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "arm64")
 endif()
