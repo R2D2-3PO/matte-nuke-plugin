@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.10)
+project(NukeInvertPlugin)
+
+# 设置 C++ 标准（Nuke 15+ 建议使用 C++17 或 20）
+set(CMAKE_CXX_STANDARD 17)
+
+# 寻找 Nuke 的包含路径（通常需要根据你的安装位置微调）
+set(NUKE_INCLUDE_DIR ""/Applications/Nuke15.1v5.app/Contents/MacOS/include"")
+
+include_directories(${NUKE_INCLUDE_DIR})
+
+# 定义生成的插件
+add_library(InvertPlugin SHARED src/MyPlugin.cpp)
+
+# 插件后缀
+set_target_properties(InvertPlugin PROPERTIES PREFIX "")
+if(APPLE)
+    set_target_properties(InvertPlugin PROPERTIES SUFFIX ".dylib")
+elseif(UNIX)
+    set_target_properties(InvertPlugin PROPERTIES SUFFIX ".so")
+else()
+    set_target_properties(InvertPlugin PROPERTIES SUFFIX ".dll")
+endif()
