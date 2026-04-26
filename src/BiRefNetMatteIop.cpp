@@ -19,6 +19,14 @@ float clamp01(float value) {
     return std::max(0.0f, std::min(1.0f, value));
 }
 
+bool sameOptions(const matte::InferenceOptions& lhs, const matte::InferenceOptions& rhs) {
+    return lhs.modelPath == rhs.modelPath &&
+           lhs.useGpu == rhs.useGpu &&
+           lhs.inputWidth == rhs.inputWidth &&
+           lhs.inputHeight == rhs.inputHeight &&
+           lhs.maskThreshold == rhs.maskThreshold;
+}
+
 }  // namespace
 
 const Iop::Description BiRefNetMatteIop::description(
@@ -88,23 +96,23 @@ void BiRefNetMatteIop::append(Hash& hash) {
 }
 
 void BiRefNetMatteIop::ensureBackendReady() {
-    if (backendAttempted_) {
-        return;
-    }
-
-    backendAttempted_ = true;
-
-    if (modelPath_[0] == '\0') {
-        backendReady_ = false;
-        backendError_ = "Model path is empty. Using placeholder matte.";
-        return;
-    }
-
     matte::InferenceOptions options;
     options.modelPath = modelPath_;
     options.useGpu = useGpu_;
     options.maskThreshold = maskThreshold_;
 
+    if (options.modelPath.empty()) {
+        backendAttempted_ = true;
+        backendReady_ = false;
+        backendError_ = "Model path is empty. Using placeholder matte.";
+        return;
+    }
+
+    if (backendAttempted_ && sameOptions(backend_.options(), options)) {
+        return;
+    }
+
+    backendAttempted_ = true;
     backendReady_ = backend_.initialize(options, &backendError_);
 }
 
