@@ -1,30 +1,27 @@
-cmake_minimum_required(VERSION 3.18)
-project(BiRefNetNukePlugin VERSION 0.1.0 LANGUAGES CXX)
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(MATTE_ENABLE_ONNXRUNTIME "Enable ONNX Runtime integration hooks" ON)
-option(MATTE_BUILD_WITH_CUDA "Enable CUDA execution provider hooks" OFF)
+option(MATTE_ENABLE_TORCHSCRIPT "Enable LibTorch / TorchScript integration" ON)
 
 # 按你本机的 Nuke 15 SDK / app 路径调整
 set(NUKE_ROOT "/Applications/Nuke15.1v5.app/Contents/MacOS" CACHE PATH "Path to the Nuke installation root")
 set(NUKE_INCLUDE_DIR "${NUKE_ROOT}/include" CACHE PATH "Path to Nuke include directory")
 set(NUKE_LIBRARY_DIR "${NUKE_ROOT}" CACHE PATH "Path to Nuke library directory")
 
-# 可选：按你本机 ONNX Runtime 解压路径调整
-set(ONNXRUNTIME_ROOT "" CACHE PATH "Optional path to ONNX Runtime distribution")
+set(TORCH_CMAKE_PREFIX "" CACHE PATH "Path to libtorch/Torch CMake prefix")
+set(TORCH_LIBRARY_DIR "" CACHE PATH "Path to libtorch runtime libraries")
+set(TORCHVISION_OPS_LIBRARY_HINT "" CACHE FILEPATH "Optional default path to torchvision/_C.so")
 
 set(MATTE_HEADERS
     include/BiRefNetPlugin/BiRefNetMatteIop.h
-    include/BiRefNetPlugin/BiRefNetOnnxBackend.h
+    include/BiRefNetPlugin/BiRefNetTorchBackend.h
     include/BiRefNetPlugin/MatteTypes.h
 )
 
 set(MATTE_SOURCES
     src/BiRefNetMatteIop.cpp
-    src/BiRefNetOnnxBackend.cpp
+    src/BiRefNetTorchBackend.cpp
     src/plugin.cpp
 )
 
@@ -38,18 +35,6 @@ target_include_directories(BiRefNetMatte
 
 target_compile_definitions(BiRefNetMatte PRIVATE NOMINMAX)
 
-if(MATTE_ENABLE_ONNXRUNTIME)
-    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_ENABLE_ONNXRUNTIME=1)
-else()
-    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_ENABLE_ONNXRUNTIME=0)
-endif()
-
-if(MATTE_BUILD_WITH_CUDA)
-    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_BUILD_WITH_CUDA=1)
-else()
-    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_BUILD_WITH_CUDA=0)
-endif()
-
 find_library(NUKE_DDIMAGE_LIBRARY DDImage PATHS ${NUKE_LIBRARY_DIR} NO_DEFAULT_PATH)
 if(NOT NUKE_DDIMAGE_LIBRARY)
     message(FATAL_ERROR "DDImage library not found. Set NUKE_LIBRARY_DIR/NUKE_ROOT correctly.")
@@ -57,31 +42,53 @@ endif()
 
 target_link_libraries(BiRefNetMatte PRIVATE ${NUKE_DDIMAGE_LIBRARY})
 
-if(MATTE_ENABLE_ONNXRUNTIME)
-    if(ONNXRUNTIME_ROOT)
-        set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/include")
-        if(APPLE)
-            find_library(ONNXRUNTIME_LIBRARY onnxruntime PATHS "${ONNXRUNTIME_ROOT}/lib" NO_DEFAULT_PATH)
-        elseif(WIN32)
-            find_library(ONNXRUNTIME_LIBRARY onnxruntime PATHS "${ONNXRUNTIME_ROOT}/lib" NO_DEFAULT_PATH)
-        else()
-            find_library(ONNXRUNTIME_LIBRARY onnxruntime PATHS "${ONNXRUNTIME_ROOT}/lib" "${ONNXRUNTIME_ROOT}/lib64" NO_DEFAULT_PATH)
+if(MATTE_ENABLE_TORCHSCRIPT)
+    if(NOT TORCH_CMAKE_PREFIX)
+        execute_process(
+            COMMAND python3 -c "import torch; print(torch.utils.cmake_prefix_path)"
+            OUTPUT_VARIABLE MATTE_DISCOVERED_TORCH_CMAKE_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(MATTE_DISCOVERED_TORCH_CMAKE_PREFIX)
+            set(TORCH_CMAKE_PREFIX "${MATTE_DISCOVERED_TORCH_CMAKE_PREFIX}")
         endif()
-
-        if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIBRARY)
-            target_include_directories(BiRefNetMatte PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-            target_link_libraries(BiRefNetMatte PRIVATE ${ONNXRUNTIME_LIBRARY})
-            target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_ONNXRUNTIME=1)
-        else()
-            message(WARNING "ONNX Runtime requested but not found under ONNXRUNTIME_ROOT. Building backend stubs only.")
-            target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_ONNXRUNTIME=0)
-        endif()
-    else()
-        message(STATUS "ONNXRUNTIME_ROOT not set. Building backend stubs only.")
-        target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_ONNXRUNTIME=0)
     endif()
+
+    if(NOT TORCH_LIBRARY_DIR)
+        execute_process(
+            COMMAND python3 -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
+            OUTPUT_VARIABLE MATTE_DISCOVERED_TORCH_LIBRARY_DIR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(MATTE_DISCOVERED_TORCH_LIBRARY_DIR)
+            set(TORCH_LIBRARY_DIR "${MATTE_DISCOVERED_TORCH_LIBRARY_DIR}")
+        endif()
+    endif()
+
+    if(NOT TORCHVISION_OPS_LIBRARY_HINT)
+        execute_process(
+            COMMAND python3 -c "import pathlib, torchvision; print(pathlib.Path(torchvision.__file__).resolve().parent / '_C.so')"
+            OUTPUT_VARIABLE MATTE_DISCOVERED_TORCHVISION_OPS_LIBRARY
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(MATTE_DISCOVERED_TORCHVISION_OPS_LIBRARY)
+            set(TORCHVISION_OPS_LIBRARY_HINT "${MATTE_DISCOVERED_TORCHVISION_OPS_LIBRARY}")
+        endif()
+    endif()
+
+    find_package(Torch REQUIRED PATHS "${TORCH_CMAKE_PREFIX}" NO_DEFAULT_PATH)
+    target_link_libraries(BiRefNetMatte PRIVATE ${TORCH_LIBRARIES})
+    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_LIBTORCH=1)
+    if(TORCHVISION_OPS_LIBRARY_HINT)
+        target_compile_definitions(BiRefNetMatte PRIVATE MATTE_DEFAULT_TORCHVISION_OPS_LIBRARY="${TORCHVISION_OPS_LIBRARY_HINT}")
+    endif()
+    separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+    target_compile_options(BiRefNetMatte PRIVATE ${TORCH_CXX_FLAGS_LIST})
 else()
-    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_ONNXRUNTIME=0)
+    target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_LIBTORCH=0)
 endif()
 
 set_target_properties(BiRefNetMatte PROPERTIES
@@ -93,7 +100,7 @@ if(APPLE)
     set_target_properties(BiRefNetMatte PROPERTIES
         SUFFIX ".dylib"
         BUILD_WITH_INSTALL_RPATH TRUE
-        INSTALL_RPATH "@loader_path"
+        INSTALL_RPATH "@loader_path;${TORCH_LIBRARY_DIR}"
     )
 endif()
 

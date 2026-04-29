@@ -1,19 +1,18 @@
-#include "BiRefNetPlugin/BiRefNetOnnxBackend.h"
+#include "BiRefNetPlugin/BiRefNetTorchBackend.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
-#if MATTE_HAS_ONNXRUNTIME
-#include <onnxruntime_cxx_api.h>
-#if MATTE_BUILD_WITH_CUDA
-#include <cuda_provider_factory.h>
-#endif
+#if MATTE_HAS_LIBTORCH
+#include <dlfcn.h>
+#include <torch/script.h>
+#include <torch/torch.h>
 #endif
 
 namespace matte {
@@ -120,97 +119,91 @@ std::vector<float> resizeMaskToSource(const float* srcMask, int srcWidth, int sr
     return resized;
 }
 
-float sigmoid(float value) {
-    if (value >= 0.0f) {
-        const float expNeg = std::exp(-value);
-        return 1.0f / (1.0f + expNeg);
+#if MATTE_HAS_LIBTORCH
+torch::Tensor extractFinalTensor(const torch::jit::IValue& value) {
+    if (value.isTensor()) {
+        return value.toTensor();
     }
-    const float expPos = std::exp(value);
-    return expPos / (1.0f + expPos);
+    if (value.isTensorList()) {
+        const auto tensors = value.toTensorVector();
+        return tensors.empty() ? torch::Tensor() : tensors.back();
+    }
+    if (value.isTuple()) {
+        const auto& elements = value.toTuple()->elements();
+        return elements.empty() ? torch::Tensor() : extractFinalTensor(elements.back());
+    }
+    if (value.isList()) {
+        const auto list = value.toList();
+        return list.empty() ? torch::Tensor() : extractFinalTensor(list.get(list.size() - 1));
+    }
+    return torch::Tensor();
 }
+#endif
 
 }  // namespace
 
-struct BiRefNetOnnxBackend::Impl {
+struct BiRefNetTorchBackend::Impl {
     bool initialized = false;
     InferenceOptions options;
 
-#if MATTE_HAS_ONNXRUNTIME
-    Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "BiRefNetMatte"};
-    std::unique_ptr<Ort::SessionOptions> sessionOptions;
-    std::unique_ptr<Ort::Session> session;
-    std::string inputName;
-    std::vector<std::string> outputNames;
+#if MATTE_HAS_LIBTORCH
+    torch::jit::script::Module module;
+    torch::Device device = torch::kCPU;
+    std::string loadedOpsLibrary;
+    void* opsLibraryHandle = nullptr;
 #endif
 };
 
-BiRefNetOnnxBackend::BiRefNetOnnxBackend() : impl_(std::make_unique<Impl>()) {}
+BiRefNetTorchBackend::BiRefNetTorchBackend() : impl_(std::make_unique<Impl>()) {}
 
-BiRefNetOnnxBackend::~BiRefNetOnnxBackend() = default;
+BiRefNetTorchBackend::~BiRefNetTorchBackend() = default;
 
-bool BiRefNetOnnxBackend::initialize(const InferenceOptions& options, std::string* errorMessage) {
+bool BiRefNetTorchBackend::initialize(const InferenceOptions& options, std::string* errorMessage) {
     impl_->options = options;
 
-#if MATTE_HAS_ONNXRUNTIME
+#if MATTE_HAS_LIBTORCH
     impl_->initialized = false;
-    impl_->session.reset();
-    impl_->inputName.clear();
-    impl_->outputNames.clear();
 
     try {
         if (options.modelPath.empty()) {
             throw std::runtime_error("Model path is empty.");
         }
-
         if (!std::filesystem::exists(options.modelPath)) {
-            throw std::runtime_error("Model file does not exist: " + options.modelPath);
+            throw std::runtime_error("TorchScript model file does not exist: " + options.modelPath);
         }
-
         if (options.inputWidth <= 0 || options.inputHeight <= 0) {
             throw std::runtime_error("Input resolution must be positive.");
         }
 
-        impl_->sessionOptions = std::make_unique<Ort::SessionOptions>();
-        impl_->sessionOptions->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        impl_->sessionOptions->SetIntraOpNumThreads(1);
-        impl_->sessionOptions->SetInterOpNumThreads(1);
-
-#if MATTE_BUILD_WITH_CUDA
-        if (options.useGpu) {
-            OrtCUDAProviderOptions cudaOptions{};
-            cudaOptions.device_id = 0;
-            impl_->sessionOptions->AppendExecutionProvider_CUDA(cudaOptions);
-        }
-#else
-        (void)options.useGpu;
-#endif
-
-        impl_->session = std::make_unique<Ort::Session>(impl_->env, options.modelPath.c_str(), *impl_->sessionOptions);
-
-        Ort::AllocatorWithDefaultOptions allocator;
-        auto inputName = impl_->session->GetInputNameAllocated(0, allocator);
-        impl_->inputName = inputName.get();
-
-        const size_t outputCount = impl_->session->GetOutputCount();
-        if (outputCount == 0) {
-            throw std::runtime_error("Model has no outputs.");
+        if (!options.torchvisionOpsLibraryPath.empty() &&
+            impl_->loadedOpsLibrary != options.torchvisionOpsLibraryPath) {
+            if (!std::filesystem::exists(options.torchvisionOpsLibraryPath)) {
+                throw std::runtime_error("TorchVision ops library does not exist: " + options.torchvisionOpsLibraryPath);
+            }
+            void* handle = dlopen(options.torchvisionOpsLibraryPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
+            if (!handle) {
+                throw std::runtime_error(std::string("Failed to load TorchVision ops library: ") + dlerror());
+            }
+            impl_->opsLibraryHandle = handle;
+            impl_->loadedOpsLibrary = options.torchvisionOpsLibraryPath;
         }
 
-        impl_->outputNames.reserve(outputCount);
-        for (size_t i = 0; i < outputCount; ++i) {
-            auto outputName = impl_->session->GetOutputNameAllocated(i, allocator);
-            impl_->outputNames.emplace_back(outputName.get());
+        impl_->device = torch::kCPU;
+        if (options.useGpu && torch::cuda::is_available()) {
+            impl_->device = torch::Device(torch::kCUDA, 0);
         }
 
+        impl_->module = torch::jit::load(options.modelPath, impl_->device);
+        impl_->module.eval();
         impl_->initialized = true;
 
         if (errorMessage) {
             errorMessage->clear();
         }
         return true;
-    } catch (const Ort::Exception& ex) {
+    } catch (const c10::Error& ex) {
         if (errorMessage) {
-            *errorMessage = std::string("ONNX Runtime initialize failed: ") + ex.what();
+            *errorMessage = std::string("LibTorch initialize failed: ") + ex.what_without_backtrace();
         }
         return false;
     } catch (const std::exception& ex) {
@@ -222,13 +215,13 @@ bool BiRefNetOnnxBackend::initialize(const InferenceOptions& options, std::strin
 #else
     impl_->initialized = false;
     if (errorMessage) {
-        *errorMessage = "ONNX Runtime is not linked yet. Set ONNXRUNTIME_ROOT to enable runtime loading.";
+        *errorMessage = "LibTorch is not linked yet. Set TORCH_CMAKE_PREFIX to enable TorchScript loading.";
     }
     return false;
 #endif
 }
 
-bool BiRefNetOnnxBackend::infer(const ImageTensor& input, MatteTensor& output, std::string* errorMessage) {
+bool BiRefNetTorchBackend::infer(const ImageTensor& input, MatteTensor& output, std::string* errorMessage) {
     if (!impl_->initialized) {
         if (errorMessage) {
             *errorMessage = "Backend is not initialized.";
@@ -243,79 +236,59 @@ bool BiRefNetOnnxBackend::infer(const ImageTensor& input, MatteTensor& output, s
         return false;
     }
 
-#if MATTE_HAS_ONNXRUNTIME
+#if MATTE_HAS_LIBTORCH
     try {
-        std::vector<float> inputTensorData = preprocessToNchw(input, impl_->options.inputWidth, impl_->options.inputHeight);
+        torch::InferenceMode guard;
 
-        const std::array<int64_t, 4> inputShape = {
+        std::vector<float> inputTensorData = preprocessToNchw(input, impl_->options.inputWidth, impl_->options.inputHeight);
+        const std::vector<int64_t> inputShape = {
             1,
             3,
             static_cast<int64_t>(impl_->options.inputHeight),
             static_cast<int64_t>(impl_->options.inputWidth),
         };
 
-        Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
-            memoryInfo,
+        torch::Tensor inputTensor = torch::from_blob(
             inputTensorData.data(),
-            inputTensorData.size(),
-            inputShape.data(),
-            inputShape.size());
+            inputShape,
+            torch::TensorOptions().dtype(torch::kFloat32)).clone().to(impl_->device);
 
-        const char* inputNames[] = {impl_->inputName.c_str()};
-        std::vector<const char*> outputNames;
-        outputNames.reserve(impl_->outputNames.size());
-        for (const std::string& name : impl_->outputNames) {
-            outputNames.push_back(name.c_str());
+        std::vector<torch::jit::IValue> inputs;
+        inputs.emplace_back(inputTensor);
+
+        torch::jit::IValue outputValue = impl_->module.forward(inputs);
+        torch::Tensor outputTensor = extractFinalTensor(outputValue);
+        if (!outputTensor.defined()) {
+            throw std::runtime_error("TorchScript model did not return a usable tensor.");
         }
 
-        auto outputValues = impl_->session->Run(
-            Ort::RunOptions{nullptr},
-            inputNames,
-            &inputTensor,
-            1,
-            outputNames.data(),
-            outputNames.size());
-
-        if (outputValues.empty()) {
-            throw std::runtime_error("Model returned no outputs.");
+        torch::Tensor logits = outputTensor;
+        if (logits.dim() == 4) {
+            logits = logits.squeeze(0);
+        }
+        if (logits.dim() == 3) {
+            logits = logits.squeeze(0);
+        }
+        if (logits.dim() != 2) {
+            throw std::runtime_error("Unexpected output tensor shape from TorchScript model.");
         }
 
-        const Ort::Value& outputTensor = outputValues.back();
-        if (!outputTensor.IsTensor()) {
-            throw std::runtime_error("Final model output is not a tensor.");
-        }
-
-        const auto tensorInfo = outputTensor.GetTensorTypeAndShapeInfo();
-        const std::vector<int64_t> outputShape = tensorInfo.GetShape();
-        const float* outputData = outputTensor.GetTensorData<float>();
-
-        if (outputShape.size() < 4) {
-            throw std::runtime_error("Unexpected output rank. Expected [N,C,H,W]-like tensor.");
-        }
-
-        const int outputHeight = static_cast<int>(outputShape[outputShape.size() - 2]);
-        const int outputWidth = static_cast<int>(outputShape[outputShape.size() - 1]);
-        if (outputWidth <= 0 || outputHeight <= 0) {
-            throw std::runtime_error("Unexpected output tensor shape.");
-        }
-
-        std::vector<float> mask(static_cast<size_t>(outputWidth) * static_cast<size_t>(outputHeight));
-        for (size_t i = 0; i < mask.size(); ++i) {
-            mask[i] = sigmoid(outputData[i]);
-        }
+        torch::Tensor maskTensor = torch::sigmoid(logits).to(torch::kCPU, torch::kFloat32).contiguous();
+        const int outputHeight = static_cast<int>(maskTensor.size(0));
+        const int outputWidth = static_cast<int>(maskTensor.size(1));
+        const float* outputData = maskTensor.data_ptr<float>();
 
         output.width = input.size.width;
         output.height = input.size.height;
-        output.alpha = resizeMaskToSource(mask.data(), outputWidth, outputHeight, output.width, output.height);
+        output.alpha = resizeMaskToSource(outputData, outputWidth, outputHeight, output.width, output.height);
 
         if (errorMessage) {
             errorMessage->clear();
         }
         return true;
-    } catch (const Ort::Exception& ex) {
+    } catch (const c10::Error& ex) {
         if (errorMessage) {
-            *errorMessage = std::string("ONNX Runtime inference failed: ") + ex.what();
+            *errorMessage = std::string("LibTorch inference failed: ") + ex.what_without_backtrace();
         }
         return false;
     } catch (const std::exception& ex) {
@@ -342,27 +315,18 @@ bool BiRefNetOnnxBackend::infer(const ImageTensor& input, MatteTensor& output, s
     }
 
     if (errorMessage) {
-        *errorMessage = "Using placeholder matte generation. Link ONNX Runtime and fill TODO sections for real BiRefNet inference.";
+        *errorMessage = "Using placeholder matte generation. Link LibTorch and export a TorchScript model for real BiRefNet inference.";
     }
     return true;
 #endif
 }
 
-bool BiRefNetOnnxBackend::isInitialized() const {
+bool BiRefNetTorchBackend::isInitialized() const {
     return impl_->initialized;
 }
 
-const InferenceOptions& BiRefNetOnnxBackend::options() const {
+const InferenceOptions& BiRefNetTorchBackend::options() const {
     return impl_->options;
-}
-
-const std::vector<std::string>& BiRefNetOnnxBackend::outputNames() const {
-#if MATTE_HAS_ONNXRUNTIME
-    return impl_->outputNames;
-#else
-    static const std::vector<std::string> kEmpty;
-    return kEmpty;
-#endif
 }
 
 }  // namespace matte

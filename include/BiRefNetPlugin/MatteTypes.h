@@ -25,6 +25,7 @@ struct MatteTensor {
 
 struct InferenceOptions {
     std::string modelPath;
+    std::string torchvisionOpsLibraryPath;
     bool useGpu = false;
     int inputWidth = 1024;
     int inputHeight = 1024;
