@@ -52,19 +52,21 @@ private:
     void setBackendStatus(const std::string& status, const std::string& error);
     bool ensureMaskCache(const DD::Image::Box& box);
     bool buildInputTensor(const DD::Image::Box& box, matte::ImageTensor& inputTensor) const;
+    bool getInferenceBox(DD::Image::Box& box) const;
     void invalidateCache();
 
     std::string modelPath_;
     std::string torchvisionOpsLibraryPath_;
     bool useGpu_;
     bool passthrough_;
+    bool useSelectionBox_;
+    bool keepAlphaOutsideBox_;
+    float selectionBox_[4];
     bool unpremultInput_;
     bool clampInput_;
     int inputWidth_;
     int inputHeight_;
     float maskThreshold_;
-    std::string backendStatus_;
-    std::string lastError_;
 
     mutable bool backendAttempted_;
     mutable bool backendReady_;

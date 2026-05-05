@@ -4,8 +4,8 @@
 #include "DDImage/Row.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
-#include <iostream>
 #include <utility>
 
 using namespace DD::Image;
@@ -15,7 +15,7 @@ namespace {
 constexpr const char* kClassName = "BiRefNetMatte";
 constexpr const char* kHelpText =
     "BiRefNet matte extraction scaffold for Nuke 15.\n"
-    "Runs a TorchScript BiRefNet model over the full image RoD and writes the matte to alpha.";
+    "Runs a TorchScript BiRefNet model over the full image RoD or a selected box and writes the matte to alpha.";
 
 float clamp01(float value) {
     return std::max(0.0f, std::min(1.0f, value));
@@ -46,13 +46,14 @@ BiRefNetMatteIop::BiRefNetMatteIop(Node* node)
 #endif
       useGpu_(false),
       passthrough_(false),
+      useSelectionBox_(false),
+      keepAlphaOutsideBox_(false),
+      selectionBox_{0.0f, 0.0f, 1920.0f, 1080.0f},
       unpremultInput_(true),
       clampInput_(true),
       inputWidth_(2048),
       inputHeight_(2048),
       maskThreshold_(0.5f),
-      backendStatus_("not initialized"),
-      lastError_(),
       backendAttempted_(false),
       backendReady_(false) {
     inputs(1);
@@ -73,7 +74,7 @@ const char* BiRefNetMatteIop::node_help() const {
 }
 
 void BiRefNetMatteIop::knobs(Knob_Callback callback) {
-    Text_knob(callback, "BiRefNet uses LibTorch + TorchScript on the full image RoD.");
+    Text_knob(callback, "BiRefNet uses LibTorch + TorchScript on the full image RoD or a selected box.");
     Divider(callback, "model");
 
     String_knob(callback, &modelPath_, "model_path", "model path");
@@ -95,6 +96,15 @@ void BiRefNetMatteIop::knobs(Knob_Callback callback) {
 
     Divider(callback, "preprocess");
 
+    Bool_knob(callback, &useSelectionBox_, "use_selection_box", "use selection box");
+    Tooltip(callback, "Run BiRefNet only on the selected image rectangle instead of the full image.");
+
+    BBox_knob(callback, selectionBox_, "selection_box", "selection box");
+    Tooltip(callback, "Viewer-draggable rectangle used as the BiRefNet crop when selection box mode is enabled.");
+
+    Bool_knob(callback, &keepAlphaOutsideBox_, "keep_alpha_outside_box", "keep alpha outside box");
+    Tooltip(callback, "When selection box mode is enabled, preserve the source alpha outside the box instead of writing zero.");
+
     Bool_knob(callback, &unpremultInput_, "unpremult_input", "unpremult input");
     Tooltip(callback, "Divide RGB by alpha before feeding the model.");
 
@@ -110,15 +120,6 @@ void BiRefNetMatteIop::knobs(Knob_Callback callback) {
     SetRange(callback, 0.0, 1.0);
     Tooltip(callback, "Applied only to the fallback placeholder matte when TorchScript inference is unavailable.");
 
-    Divider(callback, "diagnostics");
-
-    String_knob(callback, &backendStatus_, "backend_status", "backend status");
-    SetFlags(callback, Knob::READ_ONLY | Knob::NO_RERENDER | Knob::NO_UNDO);
-    Tooltip(callback, "Current TorchScript backend state. This is diagnostic only.");
-
-    String_knob(callback, &lastError_, "last_error", "last error");
-    SetFlags(callback, Knob::READ_ONLY | Knob::NO_RERENDER | Knob::NO_UNDO);
-    Tooltip(callback, "Most recent backend or inference error. If alpha looks like luma, check this field.");
 }
 
 void BiRefNetMatteIop::_validate(bool forReal) {
@@ -145,6 +146,11 @@ void BiRefNetMatteIop::append(Hash& hash) {
     hash.append(torchvisionOpsLibraryPath_.c_str());
     hash.append(static_cast<int>(useGpu_));
     hash.append(static_cast<int>(passthrough_));
+    hash.append(static_cast<int>(useSelectionBox_));
+    hash.append(static_cast<int>(keepAlphaOutsideBox_));
+    for (float value : selectionBox_) {
+        hash.append(value);
+    }
     hash.append(static_cast<int>(unpremultInput_));
     hash.append(static_cast<int>(clampInput_));
     hash.append(inputWidth_);
@@ -160,18 +166,8 @@ void BiRefNetMatteIop::invalidateCache() {
 }
 
 void BiRefNetMatteIop::setBackendStatus(const std::string& status, const std::string& error) {
-    if (backendStatus_ == status && lastError_ == error) {
-        return;
-    }
-
-    backendStatus_ = status;
-    lastError_ = error;
-
-    std::cerr << "[BiRefNetMatte] backend_status=" << backendStatus_;
-    if (!lastError_.empty()) {
-        std::cerr << " last_error=" << lastError_;
-    }
-    std::cerr << std::endl;
+    (void)status;
+    (void)error;
 }
 
 void BiRefNetMatteIop::ensureBackendReady() {
@@ -252,6 +248,40 @@ bool BiRefNetMatteIop::buildInputTensor(const Box& box, matte::ImageTensor& inpu
         }
     }
 
+    return true;
+}
+
+bool BiRefNetMatteIop::getInferenceBox(Box& box) const {
+    const Box sourceBox(info_.x(), info_.y(), info_.r(), info_.t());
+    if (sourceBox.w() <= 0 || sourceBox.h() <= 0) {
+        return false;
+    }
+
+    if (!useSelectionBox_) {
+        box = sourceBox;
+        return true;
+    }
+
+    const float left = std::min(selectionBox_[0], selectionBox_[2]);
+    const float right = std::max(selectionBox_[0], selectionBox_[2]);
+    const float bottom = std::min(selectionBox_[1], selectionBox_[3]);
+    const float top = std::max(selectionBox_[1], selectionBox_[3]);
+
+    int ix = static_cast<int>(std::floor(left));
+    int iy = static_cast<int>(std::floor(bottom));
+    int ir = static_cast<int>(std::ceil(right));
+    int it = static_cast<int>(std::ceil(top));
+
+    ix = std::max(ix, sourceBox.x());
+    iy = std::max(iy, sourceBox.y());
+    ir = std::min(ir, sourceBox.r());
+    it = std::min(it, sourceBox.t());
+
+    if (ir <= ix || it <= iy) {
+        return false;
+    }
+
+    box.set(ix, iy, ir, it);
     return true;
 }
 
@@ -391,14 +421,31 @@ void BiRefNetMatteIop::engine(int y, int x, int r, ChannelMask channels, Row& ro
         return;
     }
 
-    const Box box(info_.x(), info_.y(), info_.r(), info_.t());
+    Box box;
+    if (!getInferenceBox(box)) {
+        for (int px = x; px < r; ++px) {
+            outAlpha[px] = keepAlphaOutsideBox_ && srcA ? srcA[px] : 0.0f;
+        }
+        return;
+    }
+
+    const auto writeOutsideBoxAlpha = [&](int px) {
+        outAlpha[px] = useSelectionBox_ && (!keepAlphaOutsideBox_ || !srcA) ? 0.0f : (srcA ? srcA[px] : 1.0f);
+    };
+
     if (box.w() > 0 && box.h() > 0 && ensureMaskCache(box)) {
         std::lock_guard<std::mutex> lock(cacheMutex_);
         const int cacheWidth = cachedFrame_.box.w();
         const int rowOffset = y - cachedFrame_.box.y();
+        const bool rowInsideBox = rowOffset >= 0 && rowOffset < cachedFrame_.box.h();
 
         for (int px = x; px < r; ++px) {
             const int columnOffset = px - cachedFrame_.box.x();
+            if (!rowInsideBox || columnOffset < 0 || columnOffset >= cacheWidth) {
+                writeOutsideBoxAlpha(px);
+                continue;
+            }
+
             const size_t index = static_cast<size_t>(rowOffset) * static_cast<size_t>(cacheWidth) + static_cast<size_t>(columnOffset);
             outAlpha[px] = clamp01(cachedFrame_.alpha[index]);
         }
@@ -407,6 +454,11 @@ void BiRefNetMatteIop::engine(int y, int x, int r, ChannelMask channels, Row& ro
 
     // Fallback while backend setup/inference fails.
     for (int px = x; px < r; ++px) {
+        if (useSelectionBox_ && (px < box.x() || px >= box.r() || y < box.y() || y >= box.t())) {
+            writeOutsideBoxAlpha(px);
+            continue;
+        }
+
         const float red = srcR ? srcR[px] : 0.0f;
         const float green = srcG ? srcG[px] : red;
         const float blue = srcB ? srcB[px] : green;
