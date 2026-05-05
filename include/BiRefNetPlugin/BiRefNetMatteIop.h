@@ -39,8 +39,8 @@ private:
         std::string modelPath;
         std::string torchvisionOpsLibraryPath;
         bool useGpu = false;
-        int inputWidth = 1024;
-        int inputHeight = 1024;
+        int inputWidth = 2048;
+        int inputHeight = 2048;
         bool unpremultInput = true;
         bool clampInput = true;
         float maskThreshold = 0.5f;
@@ -49,6 +49,7 @@ private:
 
     void append(DD::Image::Hash& hash) override;
     void ensureBackendReady();
+    void setBackendStatus(const std::string& status, const std::string& error);
     bool ensureMaskCache(const DD::Image::Box& box);
     bool buildInputTensor(const DD::Image::Box& box, matte::ImageTensor& inputTensor) const;
     void invalidateCache();
@@ -62,11 +63,14 @@ private:
     int inputWidth_;
     int inputHeight_;
     float maskThreshold_;
+    std::string backendStatus_;
+    std::string lastError_;
 
     mutable bool backendAttempted_;
     mutable bool backendReady_;
     mutable std::string backendError_;
     mutable matte::BiRefNetTorchBackend backend_;
     mutable std::mutex cacheMutex_;
+    mutable std::mutex inferenceMutex_;
     mutable CachedMatteFrame cachedFrame_;
 };

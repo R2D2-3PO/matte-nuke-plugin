@@ -180,6 +180,7 @@ bool BiRefNetTorchBackend::initialize(const InferenceOptions& options, std::stri
             if (!std::filesystem::exists(options.torchvisionOpsLibraryPath)) {
                 throw std::runtime_error("TorchVision ops library does not exist: " + options.torchvisionOpsLibraryPath);
             }
+
             void* handle = dlopen(options.torchvisionOpsLibraryPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
             if (!handle) {
                 throw std::runtime_error(std::string("Failed to load TorchVision ops library: ") + dlerror());
@@ -273,7 +274,14 @@ bool BiRefNetTorchBackend::infer(const ImageTensor& input, MatteTensor& output, 
             throw std::runtime_error("Unexpected output tensor shape from TorchScript model.");
         }
 
-        torch::Tensor maskTensor = torch::sigmoid(logits).to(torch::kCPU, torch::kFloat32).contiguous();
+        torch::Tensor maskTensor = logits.to(torch::kCPU, torch::kFloat32).contiguous();
+        const float minValue = maskTensor.min().item<float>();
+        const float maxValue = maskTensor.max().item<float>();
+        if (minValue < 0.0f || maxValue > 1.0f) {
+            maskTensor = torch::sigmoid(maskTensor).contiguous();
+        } else {
+            maskTensor = torch::clamp(maskTensor, 0.0f, 1.0f).contiguous();
+        }
         const int outputHeight = static_cast<int>(maskTensor.size(0));
         const int outputWidth = static_cast<int>(maskTensor.size(1));
         const float* outputData = maskTensor.data_ptr<float>();

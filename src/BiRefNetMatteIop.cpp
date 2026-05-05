@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <utility>
 
 using namespace DD::Image;
@@ -14,7 +15,7 @@ namespace {
 constexpr const char* kClassName = "BiRefNetMatte";
 constexpr const char* kHelpText =
     "BiRefNet matte extraction scaffold for Nuke 15.\n"
-    "Current version ships with a placeholder alpha generator and ONNX Runtime integration hooks.";
+    "Runs a TorchScript BiRefNet model over the full image RoD and writes the matte to alpha.";
 
 float clamp01(float value) {
     return std::max(0.0f, std::min(1.0f, value));
@@ -25,8 +26,7 @@ bool sameOptions(const matte::InferenceOptions& lhs, const matte::InferenceOptio
            lhs.torchvisionOpsLibraryPath == rhs.torchvisionOpsLibraryPath &&
            lhs.useGpu == rhs.useGpu &&
            lhs.inputWidth == rhs.inputWidth &&
-           lhs.inputHeight == rhs.inputHeight &&
-           lhs.maskThreshold == rhs.maskThreshold;
+           lhs.inputHeight == rhs.inputHeight;
 }
 
 }  // namespace
@@ -48,9 +48,11 @@ BiRefNetMatteIop::BiRefNetMatteIop(Node* node)
       passthrough_(false),
       unpremultInput_(true),
       clampInput_(true),
-      inputWidth_(1024),
-      inputHeight_(1024),
+      inputWidth_(2048),
+      inputHeight_(2048),
       maskThreshold_(0.5f),
+      backendStatus_("not initialized"),
+      lastError_(),
       backendAttempted_(false),
       backendReady_(false) {
     inputs(1);
@@ -71,7 +73,7 @@ const char* BiRefNetMatteIop::node_help() const {
 }
 
 void BiRefNetMatteIop::knobs(Knob_Callback callback) {
-    Text_knob(callback, "BiRefNet now uses LibTorch + TorchScript on the full requested image area.");
+    Text_knob(callback, "BiRefNet uses LibTorch + TorchScript on the full image RoD.");
     Divider(callback, "model");
 
     String_knob(callback, &modelPath_, "model_path", "model path");
@@ -106,13 +108,26 @@ void BiRefNetMatteIop::knobs(Knob_Callback callback) {
 
     Float_knob(callback, &maskThreshold_, "mask_threshold", "mask threshold");
     SetRange(callback, 0.0, 1.0);
-    Tooltip(callback, "Applied to the placeholder matte path. Real BiRefNet logic can reuse or ignore it.");
+    Tooltip(callback, "Applied only to the fallback placeholder matte when TorchScript inference is unavailable.");
+
+    Divider(callback, "diagnostics");
+
+    String_knob(callback, &backendStatus_, "backend_status", "backend status");
+    SetFlags(callback, Knob::READ_ONLY | Knob::NO_RERENDER | Knob::NO_UNDO);
+    Tooltip(callback, "Current TorchScript backend state. This is diagnostic only.");
+
+    String_knob(callback, &lastError_, "last_error", "last error");
+    SetFlags(callback, Knob::READ_ONLY | Knob::NO_RERENDER | Knob::NO_UNDO);
+    Tooltip(callback, "Most recent backend or inference error. If alpha looks like luma, check this field.");
 }
 
 void BiRefNetMatteIop::_validate(bool forReal) {
     copy_info();
     info_.turn_on(Mask_Alpha);
     set_out_channels(Mask_RGBA);
+    if (forReal) {
+        ensureBackendReady();
+    }
     Iop::_validate(forReal);
 }
 
@@ -120,7 +135,7 @@ void BiRefNetMatteIop::_request(int x, int y, int r, int t, ChannelMask channels
     if (input(0)) {
         ChannelSet requested = channels;
         requested += Mask_RGBA;
-        input0().request(x, y, r, t, requested, count);
+        input0().request(info_.x(), info_.y(), info_.r(), info_.t(), requested, count);
     }
 }
 
@@ -144,6 +159,21 @@ void BiRefNetMatteIop::invalidateCache() {
     cachedFrame_.modelPath.clear();
 }
 
+void BiRefNetMatteIop::setBackendStatus(const std::string& status, const std::string& error) {
+    if (backendStatus_ == status && lastError_ == error) {
+        return;
+    }
+
+    backendStatus_ = status;
+    lastError_ = error;
+
+    std::cerr << "[BiRefNetMatte] backend_status=" << backendStatus_;
+    if (!lastError_.empty()) {
+        std::cerr << " last_error=" << lastError_;
+    }
+    std::cerr << std::endl;
+}
+
 void BiRefNetMatteIop::ensureBackendReady() {
     matte::InferenceOptions options;
     options.modelPath = modelPath_;
@@ -151,12 +181,12 @@ void BiRefNetMatteIop::ensureBackendReady() {
     options.useGpu = useGpu_;
     options.inputWidth = inputWidth_;
     options.inputHeight = inputHeight_;
-    options.maskThreshold = maskThreshold_;
 
     if (options.modelPath.empty()) {
         backendAttempted_ = true;
         backendReady_ = false;
         backendError_ = "TorchScript model path is empty. Using placeholder matte.";
+        setBackendStatus("fallback", backendError_);
         invalidateCache();
         return;
     }
@@ -167,6 +197,7 @@ void BiRefNetMatteIop::ensureBackendReady() {
 
     backendAttempted_ = true;
     backendReady_ = backend_.initialize(options, &backendError_);
+    setBackendStatus(backendReady_ ? "ready" : "fallback", backendReady_ ? std::string() : backendError_);
     invalidateCache();
 }
 
@@ -238,45 +269,88 @@ bool BiRefNetMatteIop::ensureMaskCache(const Box& box) {
             cachedFrame_.inputWidth == inputWidth_ &&
             cachedFrame_.inputHeight == inputHeight_ &&
             cachedFrame_.unpremultInput == unpremultInput_ &&
-            cachedFrame_.clampInput == clampInput_ &&
-            cachedFrame_.maskThreshold == maskThreshold_) {
+            cachedFrame_.clampInput == clampInput_) {
+            return true;
+        }
+    }
+
+    std::lock_guard<std::mutex> inferenceLock(inferenceMutex_);
+
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        if (cachedFrame_.valid &&
+            cachedFrame_.box.x() == box.x() &&
+            cachedFrame_.box.y() == box.y() &&
+            cachedFrame_.box.r() == box.r() &&
+            cachedFrame_.box.t() == box.t() &&
+            cachedFrame_.modelPath == modelPath_ &&
+            cachedFrame_.torchvisionOpsLibraryPath == torchvisionOpsLibraryPath_ &&
+            cachedFrame_.useGpu == useGpu_ &&
+            cachedFrame_.inputWidth == inputWidth_ &&
+            cachedFrame_.inputHeight == inputHeight_ &&
+            cachedFrame_.unpremultInput == unpremultInput_ &&
+            cachedFrame_.clampInput == clampInput_) {
             return true;
         }
     }
 
     ensureBackendReady();
     if (!backendReady_) {
+        setBackendStatus("fallback", backendError_);
         return false;
     }
 
     matte::ImageTensor inputTensor;
     if (!buildInputTensor(box, inputTensor)) {
         backendError_ = "Failed to gather input pixels from Nuke.";
+        setBackendStatus("fallback", backendError_);
         return false;
     }
 
     matte::MatteTensor outputTensor;
     if (!backend_.infer(inputTensor, outputTensor, &backendError_)) {
+        setBackendStatus("fallback", backendError_);
         return false;
     }
 
-    if (outputTensor.width != box.w() || outputTensor.height != box.h()) {
+    if (outputTensor.width != box.w() || outputTensor.height != box.h() ||
+        outputTensor.alpha.size() != static_cast<size_t>(box.w()) * static_cast<size_t>(box.h())) {
         backendError_ = "Backend returned an unexpected matte size.";
+        setBackendStatus("fallback", backendError_);
         return false;
     }
+
+    CachedMatteFrame frame;
+    frame.box = box;
+    frame.alpha = std::move(outputTensor.alpha);
+    frame.modelPath = modelPath_;
+    frame.torchvisionOpsLibraryPath = torchvisionOpsLibraryPath_;
+    frame.useGpu = useGpu_;
+    frame.inputWidth = inputWidth_;
+    frame.inputHeight = inputHeight_;
+    frame.unpremultInput = unpremultInput_;
+    frame.clampInput = clampInput_;
+    frame.maskThreshold = maskThreshold_;
+    frame.valid = true;
 
     std::lock_guard<std::mutex> lock(cacheMutex_);
-    cachedFrame_.box = box;
-    cachedFrame_.alpha = std::move(outputTensor.alpha);
-    cachedFrame_.modelPath = modelPath_;
-    cachedFrame_.torchvisionOpsLibraryPath = torchvisionOpsLibraryPath_;
-    cachedFrame_.useGpu = useGpu_;
-    cachedFrame_.inputWidth = inputWidth_;
-    cachedFrame_.inputHeight = inputHeight_;
-    cachedFrame_.unpremultInput = unpremultInput_;
-    cachedFrame_.clampInput = clampInput_;
-    cachedFrame_.maskThreshold = maskThreshold_;
-    cachedFrame_.valid = true;
+    if (cachedFrame_.valid &&
+        cachedFrame_.box.x() == box.x() &&
+        cachedFrame_.box.y() == box.y() &&
+        cachedFrame_.box.r() == box.r() &&
+        cachedFrame_.box.t() == box.t() &&
+        cachedFrame_.modelPath == modelPath_ &&
+        cachedFrame_.torchvisionOpsLibraryPath == torchvisionOpsLibraryPath_ &&
+        cachedFrame_.useGpu == useGpu_ &&
+        cachedFrame_.inputWidth == inputWidth_ &&
+        cachedFrame_.inputHeight == inputHeight_ &&
+        cachedFrame_.unpremultInput == unpremultInput_ &&
+        cachedFrame_.clampInput == clampInput_) {
+        return true;
+    }
+
+    cachedFrame_ = std::move(frame);
+    setBackendStatus("ready", std::string());
     return true;
 }
 
@@ -286,14 +360,24 @@ void BiRefNetMatteIop::engine(int y, int x, int r, ChannelMask channels, Row& ro
         return;
     }
 
-    ChannelSet requested = channels;
-    requested += Mask_RGBA;
-    input0().get(y, x, r, requested, row);
+    Row sourceRow(x, r);
+    input0().get(y, x, r, Mask_RGBA, sourceRow);
 
-    const float* srcR = row[Chan_Red];
-    const float* srcG = row[Chan_Green];
-    const float* srcB = row[Chan_Blue];
-    const float* srcA = row[Chan_Alpha];
+    ChannelSet passThroughChannels = channels;
+    passThroughChannels -= Mask_Alpha;
+    passThroughChannels &= Mask_RGB;
+    if (passThroughChannels) {
+        row.copy(sourceRow, passThroughChannels, x, r);
+    }
+
+    if (!(channels & Chan_Alpha)) {
+        return;
+    }
+
+    const float* srcR = sourceRow[Chan_Red];
+    const float* srcG = sourceRow[Chan_Green];
+    const float* srcB = sourceRow[Chan_Blue];
+    const float* srcA = sourceRow[Chan_Alpha];
 
     float* outAlpha = row.writable(Chan_Alpha);
     if (!outAlpha) {
@@ -307,9 +391,7 @@ void BiRefNetMatteIop::engine(int y, int x, int r, ChannelMask channels, Row& ro
         return;
     }
 
-    ensureBackendReady();
-    const Box box = requestedBox();
-
+    const Box box(info_.x(), info_.y(), info_.r(), info_.t());
     if (box.w() > 0 && box.h() > 0 && ensureMaskCache(box)) {
         std::lock_guard<std::mutex> lock(cacheMutex_);
         const int cacheWidth = cachedFrame_.box.w();
@@ -318,11 +400,7 @@ void BiRefNetMatteIop::engine(int y, int x, int r, ChannelMask channels, Row& ro
         for (int px = x; px < r; ++px) {
             const int columnOffset = px - cachedFrame_.box.x();
             const size_t index = static_cast<size_t>(rowOffset) * static_cast<size_t>(cacheWidth) + static_cast<size_t>(columnOffset);
-            float matte = cachedFrame_.alpha[index];
-            if (maskThreshold_ > 0.0f) {
-                matte = matte >= maskThreshold_ ? 1.0f : matte / std::max(maskThreshold_, 0.001f);
-            }
-            outAlpha[px] = clamp01(matte);
+            outAlpha[px] = clamp01(cachedFrame_.alpha[index]);
         }
         return;
     }

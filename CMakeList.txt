@@ -2,16 +2,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+
 option(MATTE_ENABLE_TORCHSCRIPT "Enable LibTorch / TorchScript integration" ON)
 
-# 按你本机的 Nuke 15 SDK / app 路径调整
+
 set(NUKE_ROOT "/Applications/Nuke15.1v5.app/Contents/MacOS" CACHE PATH "Path to the Nuke installation root")
 set(NUKE_INCLUDE_DIR "${NUKE_ROOT}/include" CACHE PATH "Path to Nuke include directory")
 set(NUKE_LIBRARY_DIR "${NUKE_ROOT}" CACHE PATH "Path to Nuke library directory")
-
-set(TORCH_CMAKE_PREFIX "" CACHE PATH "Path to libtorch/Torch CMake prefix")
-set(TORCH_LIBRARY_DIR "" CACHE PATH "Path to libtorch runtime libraries")
-set(TORCHVISION_OPS_LIBRARY_HINT "" CACHE FILEPATH "Optional default path to torchvision/_C.so")
 
 set(MATTE_HEADERS
     include/BiRefNetPlugin/BiRefNetMatteIop.h
@@ -43,48 +42,19 @@ endif()
 target_link_libraries(BiRefNetMatte PRIVATE ${NUKE_DDIMAGE_LIBRARY})
 
 if(MATTE_ENABLE_TORCHSCRIPT)
-    if(NOT TORCH_CMAKE_PREFIX)
-        execute_process(
-            COMMAND python3 -c "import torch; print(torch.utils.cmake_prefix_path)"
-            OUTPUT_VARIABLE MATTE_DISCOVERED_TORCH_CMAKE_PREFIX
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(MATTE_DISCOVERED_TORCH_CMAKE_PREFIX)
-            set(TORCH_CMAKE_PREFIX "${MATTE_DISCOVERED_TORCH_CMAKE_PREFIX}")
-        endif()
-    endif()
 
-    if(NOT TORCH_LIBRARY_DIR)
-        execute_process(
-            COMMAND python3 -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
-            OUTPUT_VARIABLE MATTE_DISCOVERED_TORCH_LIBRARY_DIR
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(MATTE_DISCOVERED_TORCH_LIBRARY_DIR)
-            set(TORCH_LIBRARY_DIR "${MATTE_DISCOVERED_TORCH_LIBRARY_DIR}")
-        endif()
-    endif()
+    set(Torch_DIR "/Users/jiadaixi/miniconda3/envs/nuke_build/lib/python3.10/site-packages/torch/share/cmake/Torch")
+    set(TORCHVISION_OPS_LIBRARY_HINT "${NUKE_LIBRARY_DIR}/libtorchvision.dylib")
+    set(TORCH_LIBRARY_DIR "/Users/jiadaixi/miniconda3/envs/nuke_build/lib/python3.10/site-packages/torch/lib")
 
-    if(NOT TORCHVISION_OPS_LIBRARY_HINT)
-        execute_process(
-            COMMAND python3 -c "import pathlib, torchvision; print(pathlib.Path(torchvision.__file__).resolve().parent / '_C.so')"
-            OUTPUT_VARIABLE MATTE_DISCOVERED_TORCHVISION_OPS_LIBRARY
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(MATTE_DISCOVERED_TORCHVISION_OPS_LIBRARY)
-            set(TORCHVISION_OPS_LIBRARY_HINT "${MATTE_DISCOVERED_TORCHVISION_OPS_LIBRARY}")
-        endif()
-    endif()
-
-    find_package(Torch REQUIRED PATHS "${TORCH_CMAKE_PREFIX}" NO_DEFAULT_PATH)
+    find_package(Torch REQUIRED PATHS "${Torch_DIR}" NO_DEFAULT_PATH)
     target_link_libraries(BiRefNetMatte PRIVATE ${TORCH_LIBRARIES})
     target_compile_definitions(BiRefNetMatte PRIVATE MATTE_HAS_LIBTORCH=1)
+    
     if(TORCHVISION_OPS_LIBRARY_HINT)
         target_compile_definitions(BiRefNetMatte PRIVATE MATTE_DEFAULT_TORCHVISION_OPS_LIBRARY="${TORCHVISION_OPS_LIBRARY_HINT}")
     endif()
+    
     separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
     target_compile_options(BiRefNetMatte PRIVATE ${TORCH_CXX_FLAGS_LIST})
 else()
@@ -100,7 +70,7 @@ if(APPLE)
     set_target_properties(BiRefNetMatte PROPERTIES
         SUFFIX ".dylib"
         BUILD_WITH_INSTALL_RPATH TRUE
-        INSTALL_RPATH "@loader_path;${TORCH_LIBRARY_DIR}"
+        INSTALL_RPATH "@loader_path/../MacOS;@loader_path;${TORCH_LIBRARY_DIR}"
     )
 endif()
 
